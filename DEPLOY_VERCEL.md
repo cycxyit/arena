@@ -49,10 +49,22 @@ The first request creates the Turso table automatically.
 
 ## 4. Auto sync
 
-`vercel.json` registers a cron job:
+`vercel.json` uses a Hobby-safe daily cron by default:
 
 ```json
-{ "path": "/api/run", "schedule": "*/30 * * * *" }
+{ "path": "/api/run", "schedule": "0 0 * * *" }
 ```
 
-Vercel will sync data and run one arena round every 30 minutes.
+Vercel Hobby only supports once-per-day Cron Jobs. For true 30-minute sync, use one of these:
+
+1. Upgrade the Vercel project to Pro, then change `vercel.json` to:
+
+```json
+{ "path": "/api/run", "schedule": "0,30 * * * *" }
+```
+
+2. Keep Vercel Hobby and use an external scheduler, such as GitHub Actions, EasyCron, cron-job.org, or UptimeRobot, to send a GET request to:
+
+```text
+https://your-project.vercel.app/api/run
+```
