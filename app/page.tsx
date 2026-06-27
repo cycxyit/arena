@@ -64,7 +64,7 @@ export default function Home() {
     setRunning(true);
     setMessage("Syncing daily data, backfilling 2-year history when needed...");
     try {
-      const response = await fetch("/api/run", { method: "POST" });
+      const response = await fetch("/api/run", { method: "POST", headers: { "x-arena-client": "arena-ui" } });
       const text = await response.text();
       const payload = text ? JSON.parse(text) : {};
       if (!response.ok || !isArenaState(payload.state)) throw new Error(payload.error ?? text ?? "Invalid arena cycle result");
