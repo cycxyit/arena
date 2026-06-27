@@ -1,4 +1,4 @@
-﻿# Deploy to Vercel with Turso
+# Deploy to Vercel with Turso
 
 This app supports two storage modes:
 
@@ -27,6 +27,7 @@ Required:
 TURSO_DATABASE_URL=libsql://...
 TURSO_AUTH_TOKEN=...
 ALPHAVANTAGE_API_KEYS=key1,key2,key3
+RUN_SECRET=make-a-long-random-secret
 ```
 
 Optional LLM seats:
@@ -54,10 +55,16 @@ This repository intentionally does not include `vercel.json` cron config, becaus
 The app still exposes this endpoint:
 
 ```text
-GET /api/run
+GET /api/run?secret=YOUR_RUN_SECRET
 ```
 
-Use GitHub Actions or any external scheduler to call it every 30 minutes.
+Set `RUN_SECRET` in Vercel first. When it is set, `/api/run` rejects requests that do not include the matching `secret` query parameter or `x-run-secret` header.
 
-For GitHub Actions, create a scheduled workflow manually after generating a token with `workflow` scope, or use an external scheduler such as cron-job.org, EasyCron, or UptimeRobot.
+Use GitHub Actions or any external scheduler to call it every 30 minutes. For cron-job.org, EasyCron, or UptimeRobot, schedule this URL:
+
+```text
+https://your-project.vercel.app/api/run?secret=YOUR_RUN_SECRET
+```
+
+For GitHub Actions, create a scheduled workflow manually after generating a token with `workflow` scope, or use any external scheduler that supports GET requests.
 
