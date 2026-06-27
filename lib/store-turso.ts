@@ -1,4 +1,4 @@
-import { createClient } from "@libsql/client";
+﻿import { createClient } from "@libsql/client";
 import type {
   AgentDecision,
   AgentProfile,
@@ -283,7 +283,7 @@ export async function listTursoModels(provider: LlmProvider) {
   }
   if (provider === "siliconflow") {
     if (!key) return { models: [], error: "Missing SILICONFLOW_API_KEY in environment variables" };
-    const payload = await jsonFetch("https://api.siliconflow.cn/v1/models", { headers: { ...headers, Authorization: `Bearer ${key}` } });
+    const payload = await jsonFetch("https://api.siliconflow.com/v1/models", { headers: { ...headers, Authorization: `Bearer ${key}` } });
     return { models: (payload.data ?? []).map((item: { id?: string }) => item.id).filter(Boolean).sort() };
   }
   if (provider === "gemini") {
@@ -532,7 +532,7 @@ function buildPrompt(state: PersistedArenaState, agent: AgentProfile, snapshot: 
 }
 
 async function callChat(agent: AgentProfile, prompt: string, apiKey: string) {
-  const endpoints: Partial<Record<LlmProvider, string>> = { openai: "https://api.openai.com/v1/chat/completions", openrouter: "https://openrouter.ai/api/v1/chat/completions", siliconflow: "https://api.siliconflow.cn/v1/chat/completions" };
+  const endpoints: Partial<Record<LlmProvider, string>> = { openai: "https://api.openai.com/v1/chat/completions", openrouter: "https://openrouter.ai/api/v1/chat/completions", siliconflow: "https://api.siliconflow.com/v1/chat/completions" };
   const endpoint = endpoints[agent.provider];
   if (!endpoint) throw new Error(`Unsupported chat provider: ${agent.provider}`);
   const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
@@ -649,3 +649,4 @@ async function jsonFetch(url: string, init?: RequestInit) {
 const FX_PRODUCTS = [["EURUSD", "EUR/USD"], ["GBPUSD", "GBP/USD"], ["USDJPY", "USD/JPY"], ["USDCHF", "USD/CHF"], ["AUDUSD", "AUD/USD"], ["USDCAD", "USD/CAD"], ["NZDUSD", "NZD/USD"], ["EURJPY", "EUR/JPY"]] as const;
 const CRYPTO_PRODUCTS = [["BTC-USD", "Bitcoin"], ["ETH-USD", "Ethereum"], ["SOL-USD", "Solana"], ["BNB-USD", "BNB"], ["XRP-USD", "XRP"], ["ADA-USD", "Cardano"], ["DOGE-USD", "Dogecoin"], ["AVAX-USD", "Avalanche"]] as const;
 const COMMODITY_PRODUCTS = [["XAUUSD", "Gold USD proxy", "GC=F"], ["GC=F", "Gold Futures", "GC=F"], ["XAGUSD", "Silver Spot USD", "SI=F"], ["SI=F", "Silver Futures", "SI=F"]] as const;
+

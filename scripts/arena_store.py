@@ -1,4 +1,4 @@
-import json
+﻿import json
 import math
 import os
 import random
@@ -741,7 +741,7 @@ def build_decision_prompt(agent, market_snapshot, portfolio):
 
 
 def call_chat_completions(agent, prompt, api_key):
-    endpoints = {"openai": "https://api.openai.com/v1/chat/completions", "openrouter": "https://openrouter.ai/api/v1/chat/completions", "siliconflow": "https://api.siliconflow.cn/v1/chat/completions"}
+    endpoints = {"openai": "https://api.openai.com/v1/chat/completions", "openrouter": "https://openrouter.ai/api/v1/chat/completions", "siliconflow": "https://api.siliconflow.com/v1/chat/completions"}
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     if agent["provider"] == "openrouter":
         headers["HTTP-Referer"] = "http://localhost:3000"
@@ -892,7 +892,7 @@ def list_provider_models(provider):
         if not api_key:
             return {"models": [], "error": "Missing SILICONFLOW_API_KEY in .env.local"}
         headers["Authorization"] = f"Bearer {api_key}"
-        payload = http_json("https://api.siliconflow.cn/v1/models", headers=headers, timeout=LLM_TIMEOUT_SECONDS)
+        payload = http_json("https://api.siliconflow.com/v1/models", headers=headers, timeout=LLM_TIMEOUT_SECONDS)
         models = sorted([item.get("id", "") for item in payload.get("data", []) if item.get("id")])
         return {"models": models}
     if provider == "gemini":
@@ -1154,3 +1154,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
