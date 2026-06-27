@@ -1,0 +1,41 @@
+﻿# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# next.js
+.next/
+out/
+build/
+
+# production
+.vercel/
+
+# local env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+!.env.local.example
+
+# local sqlite / runtime data
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# system files
+.DS_Store
+Thumbs.db
+
+# python cache for local fallback scripts
+__pycache__/
+*.py[cod]
