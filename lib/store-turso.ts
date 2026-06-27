@@ -610,15 +610,17 @@ function ruleDecision(agent: AgentProfile, snapshot: MarketSnapshot[], reason?: 
 }
 
 function buildPrompt(state: PersistedArenaState, agent: AgentProfile, snapshot: MarketSnapshot[]) {
+  const portfolio = portfolioState(state, agent.id);
+  const positionContext = buildPositionContext(portfolio, snapshot);
   const payload = {
     agent: { name: agent.name, risk: agent.risk, style: agent.style, custom_prompt: effectivePrompt(agent) },
-    tools: { portfolio_state: "cash, positions, equity from Turso SQLite", market_snapshot: "daily candles and returns", technical_indicators: "SMA/EMA/MACD/RSI/ATR snapshots", technical_news: "Tavily/Yahoo market technical-analysis headlines when configured", fundamentals_news: "Alpha Vantage overview for stocks plus Yahoo/Tavily macro/news summaries; commodities use Yahoo Finance bars", risk_check: "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage" },
-    account: { starting_capital: STARTING_CAPITAL, slippage_bps_range: [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], portfolio: portfolioState(state, agent.id) },
+    tools: { portfolio_state: "cash, positions, equity from Turso SQLite", position_context: "per-symbol FLAT/LONG/SHORT exposure and unrealized PnL for this AI seat", market_snapshot: "daily candles and returns", technical_indicators: "SMA/EMA/MACD/RSI/ATR snapshots", technical_news: "Tavily/Yahoo market technical-analysis headlines when configured", fundamentals_news: "Alpha Vantage overview for stocks plus Yahoo/Tavily macro/news summaries; commodities use Yahoo Finance bars", risk_check: "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage" },
+    account: { starting_capital: STARTING_CAPITAL, slippage_bps_range: [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], portfolio, position_context: positionContext },
     timeframe: "1 day",
     tradable_symbols: snapshot.map((item) => item.symbol),
     market_snapshot: snapshot
   };
-  return `You are one seat in an Alpha Arena style paper-trading competition. Think and act like a top trader from an institutional/main-force perspective: infer liquidity, trapped positions, stop zones, accumulation/distribution, trend quality, macro pressure, and invalidation. Choose exactly one action for the next daily round. Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means wait/observe. Use only the provided market data and custom_prompt. Return one-line minified JSON only, no markdown, no code fence, no newline. Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. Input: ${JSON.stringify(payload)}`;
+  return `You are one seat in an Alpha Arena style paper-trading competition. Before choosing direction, first manage your existing book: inspect cash, equity, current side, position size, average price, market price, and unrealized PnL in position_context. Think and act like a top trader from an institutional/main-force perspective: infer liquidity, trapped positions, stop zones, accumulation/distribution, trend quality, macro pressure, and invalidation. Decide whether this is a new entry, add, reduce, exit, cover, add short, or wait, then express it using exactly one action. Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means preserve capital / wait / keep current exposure. Do not ignore existing positions; avoid adding to losers unless the thesis is still valid and risk/reward improves. Use only the provided market data and custom_prompt. Return one-line minified JSON only, no markdown, no code fence, no newline. Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100 and controls server-side sizing. Keep thesis under 220 characters and mention position intent, e.g. open long, add, reduce, cover, hold. Input: ${JSON.stringify(payload)}`;
 }
 
 async function callChat(agent: AgentProfile, prompt: string, apiKey: string) {
@@ -663,6 +665,25 @@ function salvageDecision(text: string): Record<string, unknown> {
     thesis: quoted("thesis") ?? "LLM returned malformed JSON; recovered partial decision.",
     horizon: quoted("horizon") ?? "1-5 days"
   };
+}
+
+function buildPositionContext(portfolio: ReturnType<typeof portfolioState>, snapshot: MarketSnapshot[]) {
+  return snapshot.map((item) => {
+    const position = portfolio.positions.find((current) => current.symbol === item.symbol);
+    const quantity = position?.quantity ?? 0;
+    return {
+      symbol: item.symbol,
+      asset_class: item.asset_class,
+      side: quantity > 0 ? "LONG" : quantity < 0 ? "SHORT" : "FLAT",
+      quantity: Number(quantity.toFixed(8)),
+      avg_price: position?.avg_price ?? null,
+      market_price: position?.market_price ?? item.last_close,
+      market_value: position ? Number(position.market_value.toFixed(2)) : 0,
+      unrealized_pnl: position ? Number(position.unrealized_pnl.toFixed(2)) : 0,
+      cash: portfolio.cash,
+      equity: portfolio.equity
+    };
+  });
 }
 
 function portfolioState(state: PersistedArenaState, agentId: string) {

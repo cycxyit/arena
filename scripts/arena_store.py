@@ -757,19 +757,42 @@ def llm_decide(conn, agent, market_snapshot):
     return decision
 
 
+def build_position_context(portfolio, market_snapshot):
+    positions = {item["symbol"]: item for item in portfolio.get("positions", [])}
+    result = []
+    for item in market_snapshot:
+        position = positions.get(item["symbol"])
+        quantity = float(position.get("quantity", 0)) if position else 0.0
+        result.append({
+            "symbol": item["symbol"],
+            "asset_class": item.get("asset_class", "stock"),
+            "side": "LONG" if quantity > 0 else "SHORT" if quantity < 0 else "FLAT",
+            "quantity": round(quantity, 8),
+            "avg_price": position.get("avg_price") if position else None,
+            "market_price": position.get("market_price") if position else item.get("last_close"),
+            "market_value": position.get("market_value") if position else 0,
+            "unrealized_pnl": position.get("unrealized_pnl") if position else 0,
+            "cash": portfolio.get("cash"),
+            "equity": portfolio.get("equity"),
+        })
+    return result
+
+
 def build_decision_prompt(agent, market_snapshot, portfolio):
     tradable = [item["symbol"] for item in market_snapshot]
-    payload = {"agent": {"name": agent["name"], "risk": agent["risk"], "style": agent["style"], "custom_prompt": effective_prompt(agent), "watchlist": agent.get("watchlist", [])}, "tools": {"portfolio_state": "cash, positions, equity from local SQLite", "market_snapshot": "daily candles and returns", "technical_indicators": "local SMA/EMA/MACD/RSI/ATR snapshots", "technical_news": "Tavily/Yahoo market technical-analysis headlines when configured", "fundamentals_news": "Alpha Vantage overview for stocks plus Tavily/Yahoo macro/news summaries; commodities use Yahoo Finance price bars", "risk_check": "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage"}, "account": {"starting_capital": STARTING_CAPITAL, "slippage_bps_range": [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], "portfolio": portfolio}, "timeframe": "1 day", "tradable_symbols": tradable, "market_snapshot": market_snapshot}
+    position_context = build_position_context(portfolio, market_snapshot)
+    payload = {"agent": {"name": agent["name"], "risk": agent["risk"], "style": agent["style"], "custom_prompt": effective_prompt(agent), "watchlist": agent.get("watchlist", [])}, "tools": {"portfolio_state": "cash, positions, equity from local SQLite", "position_context": "per-symbol FLAT/LONG/SHORT exposure and unrealized PnL for this AI seat", "market_snapshot": "daily candles and returns", "technical_indicators": "local SMA/EMA/MACD/RSI/ATR snapshots", "technical_news": "Tavily/Yahoo market technical-analysis headlines when configured", "fundamentals_news": "Alpha Vantage overview for stocks plus Tavily/Yahoo macro/news summaries; commodities use Yahoo Finance price bars", "risk_check": "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage"}, "account": {"starting_capital": STARTING_CAPITAL, "slippage_bps_range": [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], "portfolio": portfolio, "position_context": position_context}, "timeframe": "1 day", "tradable_symbols": tradable, "market_snapshot": market_snapshot}
     return (
         "You are one seat in an Alpha Arena style paper-trading competition. "
+        "Before choosing direction, first manage your existing book: inspect cash, equity, current side, position size, average price, market price, and unrealized PnL in position_context. "
         "Think and act like a top trader from an institutional/main-force perspective: infer liquidity, trapped positions, stop zones, accumulation/distribution, trend quality, macro pressure, and invalidation. "
-        "Choose exactly one action for the next daily round. Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means wait/observe. "
-        "Use only the provided market data and custom_prompt. "
+        "Decide whether this is a new entry, add, reduce, exit, cover, add short, or wait, then express it using exactly one action. "
+        "Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means preserve capital / wait / keep current exposure. "
+        "Do not ignore existing positions; avoid adding to losers unless the thesis is still valid and risk/reward improves. Use only the provided market data and custom_prompt. "
         "Return one-line minified JSON only, no markdown, no code fence, no newline. "
-        "Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. "
+        "Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100 and controls server-side sizing. Keep thesis under 220 characters and mention position intent, e.g. open long, add, reduce, cover, hold. "
         f"Input: {json.dumps(payload, separators=(',', ':'))}"
     )
-
 
 def call_chat_completions(agent, prompt, api_key):
     endpoints = {"openai": "https://api.openai.com/v1/chat/completions", "openrouter": "https://openrouter.ai/api/v1/chat/completions", "siliconflow": "https://api.siliconflow.com/v1/chat/completions"}
