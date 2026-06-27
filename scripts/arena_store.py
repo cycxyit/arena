@@ -691,7 +691,7 @@ def refresh_research(conn, symbol, asset_class):
     conn.execute("delete from research_items where id not in (select id from research_items where symbol = ? order by created_at desc limit 12) and symbol = ?", (symbol, symbol))
 
 
-def rule_decide(agent, market_snapshot):
+def rule_decide(agent, market_snapshot, reason=None):
     if not market_snapshot:
         return {"action": "HOLD", "symbol": "--", "confidence": 0, "thesis": "No synced market bars are available.", "horizon": "1 day", "source": "error"}
     scored = []
@@ -701,7 +701,8 @@ def rule_decide(agent, market_snapshot):
     score, item = max(scored, key=lambda row: abs(row[0]))
     action = "BUY" if score > 0.0025 else "SELL" if score < -0.003 else "HOLD"
     confidence = min(94, max(42, round(abs(score) * 5200 + 48)))
-    return {"action": action, "symbol": item["symbol"], "confidence": confidence, "thesis": f"Fallback rule used because {agent['provider']} is not configured. Signal={score:.4f} on daily bars.", "horizon": "1-5 days", "source": "rule"}
+    fallback_reason = reason or f"{agent['provider']} is unavailable"
+    return {"action": action, "symbol": item["symbol"], "confidence": confidence, "thesis": f"Fallback rule used because {fallback_reason}. Signal={score:.4f} on daily bars.", "horizon": "1-5 days", "source": "rule"}
 
 
 def llm_decide(conn, agent, market_snapshot):
@@ -1006,9 +1007,8 @@ def run_cycle(conn):
             try:
                 decision = llm_decide(conn, agent, market_snapshot)
             except Exception as exc:
-                decision = rule_decide(agent, market_snapshot)
+                decision = rule_decide(agent, market_snapshot, f"{agent['provider']} call failed: {exc}")
                 decision["source"] = "error"
-                decision["thesis"] = f"{agent['provider']} call failed: {exc}. Fallback rule decision: {decision['thesis']}"
                 errors.append(f"{agent['name']}: {exc}")
             update_equity(conn, agent, decision, now)
             insert_decision(conn, agent, decision, now)

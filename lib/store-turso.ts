@@ -20,6 +20,7 @@ const HISTORY_DAYS = 730;
 const MAX_CANDLES = 760;
 const DATA_SOURCE = "Alpha Vantage + Yahoo Finance";
 const REQUEST_DELAY_SECONDS = Number(process.env.ALPHAVANTAGE_REQUEST_DELAY_SECONDS || "1.1");
+const LLM_TIMEOUT_SECONDS = Number(process.env.LLM_TIMEOUT_SECONDS || "60");
 
 type PersistedArenaState = ArenaState & { candles?: Record<string, MarketCandle[]> };
 type MarketSnapshot = {
@@ -338,9 +339,9 @@ export async function runTursoArenaCycle() {
       try {
         decision = await decide(state, agent, snapshot);
       } catch (error) {
-        decision = ruleDecision(agent, snapshot);
+        const reason = `${agent.provider} call failed: ${error instanceof Error ? error.message : String(error)}`;
+        decision = ruleDecision(agent, snapshot, reason);
         decision.source = "error";
-        decision.thesis = `${agent.provider} call failed: ${error instanceof Error ? error.message : String(error)}. Fallback rule decision: ${decision.thesis}`;
       }
       executeDecision(state, agent, decision, timestamp);
       state.decisions.unshift(decision);
@@ -512,11 +513,12 @@ async function decide(state: PersistedArenaState, agent: AgentProfile, snapshot:
   return { ...parseDecision(text, snapshot), agentId: agent.id, provider: agent.provider, model: agent.model, source: "llm", createdAt: Date.now() };
 }
 
-function ruleDecision(agent: AgentProfile, snapshot: MarketSnapshot[]): AgentDecision {
+function ruleDecision(agent: AgentProfile, snapshot: MarketSnapshot[], reason?: string): AgentDecision {
   const item = snapshot.slice().sort((a, b) => Math.abs(b.six_day_return + b.one_day_return) - Math.abs(a.six_day_return + a.one_day_return))[0];
   if (!item) return { agentId: agent.id, symbol: "--", action: "HOLD", confidence: 0, thesis: "No synced market bars are available.", horizon: "1 day", createdAt: Date.now(), provider: agent.provider, model: agent.model, source: "error" };
   const score = item.six_day_return * 1.8 + item.one_day_return * 2.8 - item.volatility_12d * 0.2;
-  return { agentId: agent.id, symbol: item.symbol, action: score > 0.0025 ? "BUY" : score < -0.003 ? "SELL" : "HOLD", confidence: Math.min(94, Math.max(42, Math.round(Math.abs(score) * 5200 + 48))), thesis: `Fallback rule used because ${agent.provider} is not configured. Signal=${score.toFixed(4)} on daily bars.`, horizon: "1-5 days", createdAt: Date.now(), provider: agent.provider, model: agent.model, source: "rule" };
+  const fallbackReason = reason || `${agent.provider} is unavailable`;
+  return { agentId: agent.id, symbol: item.symbol, action: score > 0.0025 ? "BUY" : score < -0.003 ? "SELL" : "HOLD", confidence: Math.min(94, Math.max(42, Math.round(Math.abs(score) * 5200 + 48))), thesis: `Fallback rule used because ${fallbackReason}. Signal=${score.toFixed(4)} on daily bars.`, horizon: "1-5 days", createdAt: Date.now(), provider: agent.provider, model: agent.model, source: "rule" };
 }
 
 function buildPrompt(state: PersistedArenaState, agent: AgentProfile, snapshot: MarketSnapshot[]) {
@@ -537,12 +539,12 @@ async function callChat(agent: AgentProfile, prompt: string, apiKey: string) {
   if (!endpoint) throw new Error(`Unsupported chat provider: ${agent.provider}`);
   const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
   if (agent.provider === "openrouter") Object.assign(headers, { "HTTP-Referer": env("NEXT_PUBLIC_SITE_URL") || "https://vercel.app", "X-Title": "AI Trading Arena" });
-  const payload = await jsonFetch(endpoint, { method: "POST", headers, body: JSON.stringify({ model: agent.model, messages: [{ role: "system", content: "You are a disciplined paper-trading model. Output JSON only." }, { role: "user", content: prompt }], temperature: 0.2 }) });
+  const payload = await jsonFetch(endpoint, { method: "POST", headers, body: JSON.stringify({ model: agent.model, messages: [{ role: "system", content: "You are a disciplined paper-trading model. Output JSON only." }, { role: "user", content: prompt }], temperature: 0.2, max_tokens: 700 }) }, LLM_TIMEOUT_SECONDS * 1000);
   return payload.choices?.[0]?.message?.content ?? "{}";
 }
 
 async function callGemini(agent: AgentProfile, prompt: string, apiKey: string) {
-  const payload = await jsonFetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(agent.model)}:generateContent?key=${encodeURIComponent(apiKey)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } }) });
+  const payload = await jsonFetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(agent.model)}:generateContent?key=${encodeURIComponent(apiKey)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, responseMimeType: "application/json", maxOutputTokens: 700 } }) }, LLM_TIMEOUT_SECONDS * 1000);
   return payload.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
 }
 
@@ -639,8 +641,8 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function jsonFetch(url: string, init?: RequestInit) {
-  const response = await fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(25000) });
+async function jsonFetch(url: string, init?: RequestInit, timeoutMs = 25000) {
+  const response = await fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
   const text = await response.text();
   if (!response.ok) throw new Error(text.slice(0, 500) || `${response.status} ${response.statusText}`);
   return JSON.parse(text);
