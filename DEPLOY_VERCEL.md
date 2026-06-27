@@ -49,22 +49,15 @@ The first request creates the Turso table automatically.
 
 ## 4. Auto sync
 
-`vercel.json` uses a Hobby-safe daily cron by default:
+This repository intentionally does not include `vercel.json` cron config, because some Vercel projects reject cron settings during config validation.
 
-```json
-{ "path": "/api/run", "schedule": "0 0 * * *" }
-```
-
-Vercel Hobby only supports once-per-day Cron Jobs. For true 30-minute sync, use one of these:
-
-1. Upgrade the Vercel project to Pro, then change `vercel.json` to:
-
-```json
-{ "path": "/api/run", "schedule": "0,30 * * * *" }
-```
-
-2. Keep Vercel Hobby and use an external scheduler, such as GitHub Actions, EasyCron, cron-job.org, or UptimeRobot, to send a GET request to:
+The app still exposes this endpoint:
 
 ```text
-https://your-project.vercel.app/api/run
+GET /api/run
 ```
+
+Use GitHub Actions or any external scheduler to call it every 30 minutes.
+
+For GitHub Actions, create a scheduled workflow manually after generating a token with `workflow` scope, or use an external scheduler such as cron-job.org, EasyCron, or UptimeRobot.
+
