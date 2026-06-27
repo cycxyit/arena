@@ -65,8 +65,9 @@ export default function Home() {
     setMessage("Syncing daily data, backfilling 2-year history when needed...");
     try {
       const response = await fetch("/api/run", { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok || !isArenaState(payload.state)) throw new Error(payload.error ?? "Invalid arena cycle result");
+      const text = await response.text();
+      const payload = text ? JSON.parse(text) : {};
+      if (!response.ok || !isArenaState(payload.state)) throw new Error(payload.error ?? text ?? "Invalid arena cycle result");
       setState(payload.state);
       if (payload.errors?.length) setMessage(payload.errors[0]);
       else {
@@ -76,8 +77,8 @@ export default function Home() {
         else if (updated.length) setMessage(`Updated: ${updated.join(", ")}; AI analyzed new daily bars`);
         else setMessage("No new daily bars; AI analysis skipped");
       }
-    } catch {
-      setMessage("Alpha Vantage sync failed. Check API key pool, entitlement, or rate limits.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Run round failed. Check deployment logs.");
     } finally {
       syncingRef.current = false;
       setRunning(false);

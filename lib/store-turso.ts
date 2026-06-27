@@ -19,6 +19,7 @@ const MIN_TRADE_NOTIONAL = 10;
 const HISTORY_DAYS = 730;
 const MAX_CANDLES = 760;
 const DATA_SOURCE = "Alpha Vantage + Yahoo Finance";
+const REQUEST_DELAY_SECONDS = Number(process.env.ALPHAVANTAGE_REQUEST_DELAY_SECONDS || "1.1");
 
 type PersistedArenaState = ArenaState & { candles?: Record<string, MarketCandle[]> };
 type MarketSnapshot = {
@@ -302,7 +303,9 @@ export async function runTursoArenaCycle() {
   const errors: string[] = [];
   state.candles ||= {};
 
-  for (const item of state.symbols.filter((symbol) => symbol.active)) {
+  const activeSymbols = state.symbols.filter((symbol) => symbol.active);
+  for (let symbolIndex = 0; symbolIndex < activeSymbols.length; symbolIndex += 1) {
+    const item = activeSymbols[symbolIndex];
     try {
       const candles = await fetchCandles(item.symbol, item.assetClass);
       const previous = state.candles[item.symbol]?.length ?? 0;
@@ -319,6 +322,9 @@ export async function runTursoArenaCycle() {
     } catch (error) {
       failed.push(item.symbol);
       errors.push(`${item.symbol}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (REQUEST_DELAY_SECONDS > 0 && symbolIndex < activeSymbols.length - 1) {
+      await sleep(REQUEST_DELAY_SECONDS * 1000);
     }
   }
 
@@ -385,9 +391,9 @@ function chooseAlphaKey() {
 async function fetchCandles(symbol: string, assetClass: AssetClass): Promise<MarketCandle[]> {
   if (assetClass === "commodity") return fetchYahooCandles(symbol);
   const params: Record<string, string> = assetClass === "stock"
-    ? { function: "TIME_SERIES_DAILY", symbol, outputsize: "full" }
+    ? { function: "TIME_SERIES_DAILY", symbol, outputsize: "compact" }
     : assetClass === "forex"
-      ? { function: "FX_DAILY", from_symbol: symbol.slice(0, 3), to_symbol: symbol.slice(3), outputsize: "full" }
+      ? { function: "FX_DAILY", from_symbol: symbol.slice(0, 3), to_symbol: symbol.slice(3), outputsize: "compact" }
       : { function: "DIGITAL_CURRENCY_DAILY", symbol: splitCrypto(symbol)[0], market: splitCrypto(symbol)[1] };
   const payload = await alphaQuery(params);
   const key = Object.keys(payload).find((name) => name.startsWith("Time Series"));
@@ -629,8 +635,12 @@ function latestSyncTimestamp(state: PersistedArenaState) {
   return Math.max(0, ...Object.values(state.candles ?? {}).map((items) => items.at(-1)?.timestamp ?? 0)) || null;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function jsonFetch(url: string, init?: RequestInit) {
-  const response = await fetch(url, init);
+  const response = await fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(25000) });
   const text = await response.text();
   if (!response.ok) throw new Error(text.slice(0, 500) || `${response.status} ${response.statusText}`);
   return JSON.parse(text);
