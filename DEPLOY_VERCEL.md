@@ -28,6 +28,7 @@ TURSO_DATABASE_URL=libsql://...
 TURSO_AUTH_TOKEN=...
 ALPHAVANTAGE_API_KEYS=key1,key2,key3
 RUN_SECRET=make-a-long-random-secret
+LLM_TIMEOUT_SECONDS=20
 ```
 
 Optional LLM seats:

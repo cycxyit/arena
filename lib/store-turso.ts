@@ -20,7 +20,7 @@ const HISTORY_DAYS = 730;
 const MAX_CANDLES = 760;
 const DATA_SOURCE = "Alpha Vantage + Yahoo Finance";
 const REQUEST_DELAY_SECONDS = Number(process.env.ALPHAVANTAGE_REQUEST_DELAY_SECONDS || "1.1");
-const LLM_TIMEOUT_SECONDS = Number(process.env.LLM_TIMEOUT_SECONDS || "60");
+const LLM_TIMEOUT_SECONDS = Math.min(Number(process.env.LLM_TIMEOUT_SECONDS || "20"), 25);
 const TAVILY_API_KEY = env("TAVILY_API_KEY");
 const RESEARCH_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
@@ -355,16 +355,19 @@ export async function runTursoArenaCycle() {
   const timestamp = Date.now();
 
   if (snapshot.length) {
-    for (const agent of state.agents.map(withRuntimeFlags)) {
+    const agents = state.agents.map(withRuntimeFlags);
+    const decisions = await Promise.all(agents.map(async (agent) => {
       const agentSnapshot = filterSnapshotForAgent(state, agent, snapshot);
-      let decision: AgentDecision;
       try {
-        decision = await decide(state, agent, agentSnapshot);
+        return { agent, decision: await decide(state, agent, agentSnapshot) };
       } catch (error) {
         const reason = `${agent.provider} call failed: ${error instanceof Error ? error.message : String(error)}`;
-        decision = ruleDecision(agent, agentSnapshot, reason);
+        const decision = ruleDecision(agent, agentSnapshot, reason);
         decision.source = "error";
+        return { agent, decision };
       }
+    }));
+    for (const { agent, decision } of decisions) {
       executeDecision(state, agent, decision, timestamp);
       state.decisions.unshift(decision);
     }
@@ -408,11 +411,11 @@ function defaultModel(provider: LlmProvider) {
   return { openai: "gpt-4o-mini", openrouter: "openai/gpt-4o-mini", gemini: "gemini-1.5-flash", siliconflow: "Qwen/Qwen2.5-72B-Instruct", local: "local-rule" }[provider];
 }
 
-async function alphaQuery(params: Record<string, string>) {
+async function alphaQuery(params: Record<string, string>, timeoutMs = 15000) {
   const key = chooseAlphaKey();
   const url = new URL("https://www.alphavantage.co/query");
   Object.entries({ ...params, apikey: key }).forEach(([name, value]) => url.searchParams.set(name, value));
-  const payload = await jsonFetch(url.toString(), { headers: { "User-Agent": "ai-arena/0.5" } });
+  const payload = await jsonFetch(url.toString(), { headers: { "User-Agent": "ai-arena/0.5" } }, timeoutMs);
   for (const keyName of ["Error Message", "Information", "Note"]) {
     if (payload[keyName]) throw new Error(String(payload[keyName]));
   }
@@ -431,32 +434,34 @@ async function refreshResearch(state: PersistedArenaState, item: TradingSymbol) 
   state.researchUpdatedAt ||= {};
   const previous = state.researchUpdatedAt[item.symbol] ?? 0;
   if (Date.now() - previous < RESEARCH_MAX_AGE_MS) return;
-  const results: ResearchItem[] = [];
-  if (item.assetClass === "stock") {
-    try {
-      const overview = await alphaQuery({ function: "OVERVIEW", symbol: item.symbol });
-      const fields = ["Name", "Sector", "Industry", "MarketCapitalization", "PERatio", "ForwardPE", "ProfitMargin", "RevenueTTM", "QuarterlyEarningsGrowthYOY", "QuarterlyRevenueGrowthYOY", "AnalystTargetPrice"];
-      const summary = fields.map((field) => overview[field] ? `${field}: ${overview[field]}` : "").filter(Boolean).join("; ");
-      if (summary) results.push({ source: "Alpha Vantage", title: `${item.symbol} fundamentals`, url: "https://www.alphavantage.co/documentation/", summary: summary.slice(0, 900), published_at: "" });
-    } catch (error) {
-      results.push({ source: "Alpha Vantage", title: `${item.symbol} fundamentals unavailable`, summary: String(error).slice(0, 260), published_at: "" });
-    }
-  }
-  try { results.push(...await yahooNews(item.symbol)); } catch {}
-  try { results.push(...await tavilySearch(`${item.symbol} technical analysis fundamentals market news`)); } catch {}
+  const tasks: Array<Promise<ResearchItem[]>> = [yahooNews(item.symbol), tavilySearch(`${item.symbol} technical analysis fundamentals market news`)];
+  if (item.assetClass === "stock") tasks.push(alphaOverview(item.symbol));
+  const settled = await Promise.allSettled(tasks);
+  const results = settled.flatMap((item) => item.status === "fulfilled" ? item.value : []);
   if (results.length) state.research[item.symbol] = dedupeResearch(results).slice(0, 8);
   state.researchUpdatedAt[item.symbol] = Date.now();
 }
 
+async function alphaOverview(symbol: string): Promise<ResearchItem[]> {
+  try {
+    const overview = await alphaQuery({ function: "OVERVIEW", symbol }, 6500);
+    const fields = ["Name", "Sector", "Industry", "MarketCapitalization", "PERatio", "ForwardPE", "ProfitMargin", "RevenueTTM", "QuarterlyEarningsGrowthYOY", "QuarterlyRevenueGrowthYOY", "AnalystTargetPrice"];
+    const summary = fields.map((field) => overview[field] ? `${field}: ${overview[field]}` : "").filter(Boolean).join("; ");
+    return summary ? [{ source: "Alpha Vantage", title: `${symbol} fundamentals`, url: "https://www.alphavantage.co/documentation/", summary: summary.slice(0, 900), published_at: "" }] : [];
+  } catch (error) {
+    return [{ source: "Alpha Vantage", title: `${symbol} fundamentals unavailable`, summary: String(error).slice(0, 260), published_at: "" }];
+  }
+}
+
 async function yahooNews(symbol: string): Promise<ResearchItem[]> {
   const query = new URLSearchParams({ q: symbol, newsCount: "3", quotesCount: "0" });
-  const payload = await jsonFetch(`https://query1.finance.yahoo.com/v1/finance/search?${query}`, { headers: { "User-Agent": "Mozilla/5.0 ai-arena/0.5" } }, 15000);
+  const payload = await jsonFetch(`https://query1.finance.yahoo.com/v1/finance/search?${query}`, { headers: { "User-Agent": "Mozilla/5.0 ai-arena/0.5" } }, 6500);
   return (payload.news ?? []).slice(0, 3).map((item: { title?: string; link?: string; publisher?: string; providerPublishTime?: number }) => ({ source: "Yahoo Finance", title: item.title ?? "Untitled", url: item.link, summary: item.publisher || item.title || "", published_at: item.providerPublishTime ? new Date(item.providerPublishTime * 1000).toISOString() : "" }));
 }
 
 async function tavilySearch(query: string): Promise<ResearchItem[]> {
   if (!TAVILY_API_KEY) return [];
-  const payload = await jsonFetch("https://api.tavily.com/search", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TAVILY_API_KEY}` }, body: JSON.stringify({ query, topic: "news", search_depth: "basic", time_range: "week", max_results: 3, include_answer: false, include_raw_content: false }) }, 20000);
+  const payload = await jsonFetch("https://api.tavily.com/search", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TAVILY_API_KEY}` }, body: JSON.stringify({ query, topic: "news", search_depth: "basic", time_range: "week", max_results: 3, include_answer: false, include_raw_content: false }) }, 6500);
   return (payload.results ?? []).slice(0, 3).map((item: { title?: string; url?: string; content?: string; published_date?: string }) => ({ source: "Tavily", title: item.title ?? "Untitled", url: item.url, summary: item.content || item.title || "", published_at: item.published_date ?? "" }));
 }
 
@@ -781,7 +786,7 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function jsonFetch(url: string, init?: RequestInit, timeoutMs = 25000) {
+async function jsonFetch(url: string, init?: RequestInit, timeoutMs = 15000) {
   const response = await fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
   const text = await response.text();
   if (!response.ok) throw new Error(text.slice(0, 500) || `${response.status} ${response.statusText}`);
