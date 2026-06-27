@@ -735,8 +735,8 @@ def build_decision_prompt(agent, market_snapshot, portfolio):
         "Choose exactly one action for the next daily round. Use only the provided market data and the custom_prompt. "
         "Analyze both technical setup and fundamental/macro context before deciding. "
         "Think like a human trader: review portfolio, choose intent, then the server will risk-check and execute the order. "
-        "Return strict JSON only, with keys: action, symbol, confidence, thesis, horizon. "
-        "action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. "
+        "Return one-line minified JSON only, no markdown, no code fence, no newline. "
+        "Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. "
         f"Input: {json.dumps(payload, separators=(',', ':'))}"
     )
 
@@ -766,6 +766,16 @@ def call_gemini(agent, prompt, api_key):
         raise RuntimeError(f"Unexpected gemini response: {data}") from exc
 
 
+def salvage_llm_decision(text):
+    def pick(key):
+        match = re.search(r'"?' + re.escape(key) + r'"?\s*:\s*"?([^",}\n]+)', text, re.I)
+        return match.group(1).strip() if match else None
+    def quoted(key):
+        match = re.search(r'"?' + re.escape(key) + r'"?\s*:\s*"([^"\n]{1,600})', text, re.I)
+        return match.group(1).strip() if match else None
+    return {"action": pick("action") or "HOLD", "symbol": pick("symbol") or "", "confidence": pick("confidence") or 0, "thesis": quoted("thesis") or "LLM returned malformed JSON; recovered partial decision.", "horizon": quoted("horizon") or "1-5 days"}
+
+
 def parse_llm_decision(text, market_snapshot):
     raw = text.strip()
     if raw.startswith("```"):
@@ -774,7 +784,10 @@ def parse_llm_decision(text, market_snapshot):
     match = re.search(r"\{.*\}", raw, re.S)
     if match:
         raw = match.group(0)
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = salvage_llm_decision(raw)
     symbols = {item["symbol"] for item in market_snapshot}
     symbol = str(data.get("symbol", "")).upper()
     if symbol not in symbols:

@@ -530,7 +530,7 @@ function buildPrompt(state: PersistedArenaState, agent: AgentProfile, snapshot: 
     tradable_symbols: snapshot.map((item) => item.symbol),
     market_snapshot: snapshot
   };
-  return `You are one seat in an Alpha Arena style paper-trading competition. Choose exactly one action for the next daily round. Use only the provided market data and custom_prompt. Analyze technical setup and fundamental/macro context. Return strict JSON only with keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Input: ${JSON.stringify(payload)}`;
+  return `You are one seat in an Alpha Arena style paper-trading competition. Choose exactly one action for the next daily round. Use only the provided market data and custom_prompt. Analyze technical setup and fundamental/macro context. Return one-line minified JSON only, no markdown, no code fence, no newline. Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. Input: ${JSON.stringify(payload)}`;
 }
 
 async function callChat(agent: AgentProfile, prompt: string, apiKey: string) {
@@ -551,12 +551,30 @@ async function callGemini(agent: AgentProfile, prompt: string, apiKey: string) {
 function parseDecision(text: string, snapshot: MarketSnapshot[]): Pick<AgentDecision, "symbol" | "action" | "confidence" | "thesis" | "horizon"> {
   const raw = text.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   const match = raw.match(/\{[\s\S]*\}/);
-  const data = JSON.parse(match?.[0] ?? raw);
+  const candidate = match?.[0] ?? raw;
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(candidate);
+  } catch {
+    data = salvageDecision(candidate);
+  }
   const symbols = new Set(snapshot.map((item) => item.symbol));
   const symbol = symbols.has(String(data.symbol).toUpperCase()) ? String(data.symbol).toUpperCase() : snapshot[0]?.symbol ?? "--";
   const actionText = String(data.action ?? "HOLD").toUpperCase();
   const action = (["BUY", "SELL", "HOLD"].includes(actionText) ? actionText : "HOLD") as "BUY" | "SELL" | "HOLD";
-  return { symbol, action, confidence: Math.max(0, Math.min(100, Number(data.confidence ?? 0))), thesis: String(data.thesis ?? "LLM returned no thesis.").slice(0, 600), horizon: String(data.horizon ?? "1-5 days").slice(0, 80) };
+  return { symbol, action, confidence: Math.max(0, Math.min(100, Number(data.confidence ?? 0))), thesis: String(data.thesis ?? "LLM returned malformed JSON; recovered executable fields.").slice(0, 600), horizon: String(data.horizon ?? "1-5 days").slice(0, 80) };
+}
+
+function salvageDecision(text: string): Record<string, unknown> {
+  const pick = (key: string) => text.match(new RegExp(`"?${key}"?\\s*:\\s*"?([^",}\\n]+)`, "i"))?.[1]?.trim();
+  const quoted = (key: string) => text.match(new RegExp(`"?${key}"?\\s*:\\s*"([^"\\n]{1,600})`, "i"))?.[1]?.trim();
+  return {
+    action: pick("action") ?? "HOLD",
+    symbol: pick("symbol") ?? "",
+    confidence: Number(pick("confidence") ?? 0),
+    thesis: quoted("thesis") ?? "LLM returned malformed JSON; recovered partial decision.",
+    horizon: quoted("horizon") ?? "1-5 days"
+  };
 }
 
 function portfolioState(state: PersistedArenaState, agentId: string) {
