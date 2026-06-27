@@ -1,4 +1,4 @@
-﻿import { execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ArenaState, AssetClass, AgentKind, LlmProvider } from "@/lib/types";
@@ -16,6 +16,7 @@ export type SeatInput = {
   style?: string;
   risk?: "low" | "medium" | "high";
   color?: string;
+  watchlist?: string[];
 };
 
 export type ProductResult = { symbol: string; name: string; assetClass: AssetClass; type: string; region: string; currency: string };
@@ -77,6 +78,11 @@ export async function listModels(provider: LlmProvider) {
 export async function runArenaCycle() {
   if (useTurso()) return (await turso()).runTursoArenaCycle();
   return runStore<{ synced: string[]; updated?: string[]; backfilled?: string[]; analyzed?: boolean; failed: string[]; errors: string[]; state: ArenaState }>(["run"]);
+}
+
+export async function resetArenaCompetition() {
+  if (useTurso()) return (await turso()).resetTursoCompetition();
+  return runStore<{ reset: boolean; state: ArenaState }>(["reset"]);
 }
 
 async function runStore<T>(args: string[]) {

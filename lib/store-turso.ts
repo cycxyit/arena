@@ -1,4 +1,4 @@
-﻿import { createClient } from "@libsql/client";
+import { createClient } from "@libsql/client";
 import type {
   AgentDecision,
   AgentProfile,
@@ -21,15 +21,20 @@ const MAX_CANDLES = 760;
 const DATA_SOURCE = "Alpha Vantage + Yahoo Finance";
 const REQUEST_DELAY_SECONDS = Number(process.env.ALPHAVANTAGE_REQUEST_DELAY_SECONDS || "1.1");
 const LLM_TIMEOUT_SECONDS = Number(process.env.LLM_TIMEOUT_SECONDS || "60");
+const TAVILY_API_KEY = env("TAVILY_API_KEY");
+const RESEARCH_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
-type PersistedArenaState = ArenaState & { candles?: Record<string, MarketCandle[]> };
+type ResearchItem = { source: string; title: string; url?: string; summary: string; published_at?: string };
+type PersistedArenaState = ArenaState & { candles?: Record<string, MarketCandle[]>; research?: Record<string, ResearchItem[]>; researchUpdatedAt?: Record<string, number> };
 type MarketSnapshot = {
   symbol: string;
+  asset_class: AssetClass;
   last_close: number;
   one_day_return: number;
   six_day_return: number;
   volatility_12d: number;
   indicators: IndicatorSnapshot;
+  research?: ResearchItem[];
   latest_bars: Array<{ date: string; close: number; volume: number }>;
 };
 
@@ -83,7 +88,7 @@ function withRuntimeFlags(agent: AgentProfile): AgentProfile {
 }
 
 function defaultPrompt(agent: Pick<AgentProfile, "risk" | "style">) {
-  return `Act as a disciplined ${agent.risk || "medium"}-risk trading analyst running the ${agent.style || "balanced multi-asset strategy"}. For every daily round, combine technical analysis and fundamental/macro context. Technical checks: trend, momentum, volatility, recent volume, support/resistance, and risk/reward. Fundamental checks: business quality for stocks, macro/rates context for FX, liquidity/adoption/regime for crypto, and real rates/USD/liquidity for commodities. Prefer capital preservation, avoid overtrading, size conviction cautiously, and explain the key risk in the thesis.`;
+  return `Act like an elite discretionary trader with a market-maker/main-force perspective, running the ${agent.style || "balanced multi-asset strategy"} at ${agent.risk || "medium"} risk. Read liquidity, stops, accumulation/distribution, trend, momentum, volatility, support/resistance, and risk/reward. Add fundamental/macro context: business quality for stocks, rates/USD flows for FX, liquidity/adoption/regime for crypto, and real rates/USD/liquidity for commodities. Avoid overtrading, protect capital, size conviction cautiously, and explain the key risk in the thesis.`;
 }
 
 function effectivePrompt(agent: AgentProfile) {
@@ -126,13 +131,15 @@ async function loadState(): Promise<PersistedArenaState> {
   const payload = result.rows[0]?.payload;
   const state = typeof payload === "string" ? (JSON.parse(payload) as PersistedArenaState) : initialState();
   state.symbols ||= defaultSymbols;
-  state.agents = (state.agents?.length ? state.agents : defaultSeats).map(withRuntimeFlags);
+  state.agents = (state.agents?.length ? state.agents : defaultSeats).map((agent) => withRuntimeFlags({ ...agent, watchlist: normalizeWatchlist(agent.watchlist, state.symbols) }));
   state.decisions ||= [];
   state.equity ||= [];
   state.positions ||= [];
   state.orders ||= [];
   state.cash ||= Object.fromEntries(state.agents.map((agent) => [agent.id, STARTING_CAPITAL]));
   state.indicators ||= {};
+  state.research ||= {};
+  state.researchUpdatedAt ||= {};
   state.latestPrices ||= {};
   state.candles ||= {};
   state.startingCapital = STARTING_CAPITAL;
@@ -201,6 +208,7 @@ export async function addTursoSeat(input: SeatInput) {
     risk,
     color: input.color || "#111111",
     prompt: input.prompt || "",
+    watchlist: normalizeWatchlist(input.watchlist, state.symbols),
     enabled: false
   });
   state.agents = state.agents.filter((item) => item.id !== id).concat(agent);
@@ -224,6 +232,18 @@ export async function deleteTursoSeat(id: string) {
   if (state.cash) delete state.cash[clean];
   await saveState(state);
   return { id: clean };
+}
+
+export async function resetTursoCompetition() {
+  const state = await loadState();
+  const timestamp = Date.now();
+  state.decisions = [];
+  state.positions = [];
+  state.orders = [];
+  state.cash = Object.fromEntries(state.agents.map((agent) => [agent.id, STARTING_CAPITAL]));
+  state.equity = state.agents.map((agent) => ({ agentId: agent.id, timestamp, equity: STARTING_CAPITAL }));
+  await saveState(state);
+  return { reset: true, state: publicState(state) };
 }
 
 
@@ -315,6 +335,7 @@ export async function runTursoArenaCycle() {
       if (latest) state.latestPrices[item.symbol] = latest.close;
       state.indicators ||= {};
       state.indicators[item.symbol] = computeIndicators(state.candles[item.symbol].slice(-80));
+      await refreshResearch(state, item);
       synced.push(item.symbol);
       if ((state.candles[item.symbol]?.length ?? 0) > previous || previous < 500) {
         updated.push(item.symbol);
@@ -335,12 +356,13 @@ export async function runTursoArenaCycle() {
 
   if (snapshot.length) {
     for (const agent of state.agents.map(withRuntimeFlags)) {
+      const agentSnapshot = filterSnapshotForAgent(state, agent, snapshot);
       let decision: AgentDecision;
       try {
-        decision = await decide(state, agent, snapshot);
+        decision = await decide(state, agent, agentSnapshot);
       } catch (error) {
         const reason = `${agent.provider} call failed: ${error instanceof Error ? error.message : String(error)}`;
-        decision = ruleDecision(agent, snapshot, reason);
+        decision = ruleDecision(agent, agentSnapshot, reason);
         decision.source = "error";
       }
       executeDecision(state, agent, decision, timestamp);
@@ -367,6 +389,21 @@ function normalizeId(value: string) {
   return (value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || `seat-${Date.now()}`).slice(0, 64);
 }
 
+function normalizeWatchlist(input: unknown, symbols: TradingSymbol[]) {
+  const allowed = new Set(symbols.map((item) => item.symbol));
+  const items = Array.isArray(input) ? input : [];
+  return Array.from(new Set(items.map((item) => String(item).trim().toUpperCase()).filter((item) => allowed.has(item))));
+}
+
+function filterSnapshotForAgent(state: PersistedArenaState, agent: AgentProfile, snapshot: MarketSnapshot[]) {
+  const watchlist = normalizeWatchlist(agent.watchlist, state.symbols);
+  if (!watchlist.length) return snapshot;
+  const allowed = new Set(watchlist);
+  const filtered = snapshot.filter((item) => allowed.has(item.symbol));
+  if (filtered.length) return filtered;
+  return buildMarketSnapshot(state, watchlist);
+}
+
 function defaultModel(provider: LlmProvider) {
   return { openai: "gpt-4o-mini", openrouter: "openai/gpt-4o-mini", gemini: "gemini-1.5-flash", siliconflow: "Qwen/Qwen2.5-72B-Instruct", local: "local-rule" }[provider];
 }
@@ -389,6 +426,49 @@ function chooseAlphaKey() {
   return keys[Math.floor(Math.random() * keys.length)];
 }
 
+async function refreshResearch(state: PersistedArenaState, item: TradingSymbol) {
+  state.research ||= {};
+  state.researchUpdatedAt ||= {};
+  const previous = state.researchUpdatedAt[item.symbol] ?? 0;
+  if (Date.now() - previous < RESEARCH_MAX_AGE_MS) return;
+  const results: ResearchItem[] = [];
+  if (item.assetClass === "stock") {
+    try {
+      const overview = await alphaQuery({ function: "OVERVIEW", symbol: item.symbol });
+      const fields = ["Name", "Sector", "Industry", "MarketCapitalization", "PERatio", "ForwardPE", "ProfitMargin", "RevenueTTM", "QuarterlyEarningsGrowthYOY", "QuarterlyRevenueGrowthYOY", "AnalystTargetPrice"];
+      const summary = fields.map((field) => overview[field] ? `${field}: ${overview[field]}` : "").filter(Boolean).join("; ");
+      if (summary) results.push({ source: "Alpha Vantage", title: `${item.symbol} fundamentals`, url: "https://www.alphavantage.co/documentation/", summary: summary.slice(0, 900), published_at: "" });
+    } catch (error) {
+      results.push({ source: "Alpha Vantage", title: `${item.symbol} fundamentals unavailable`, summary: String(error).slice(0, 260), published_at: "" });
+    }
+  }
+  try { results.push(...await yahooNews(item.symbol)); } catch {}
+  try { results.push(...await tavilySearch(`${item.symbol} technical analysis fundamentals market news`)); } catch {}
+  if (results.length) state.research[item.symbol] = dedupeResearch(results).slice(0, 8);
+  state.researchUpdatedAt[item.symbol] = Date.now();
+}
+
+async function yahooNews(symbol: string): Promise<ResearchItem[]> {
+  const query = new URLSearchParams({ q: symbol, newsCount: "3", quotesCount: "0" });
+  const payload = await jsonFetch(`https://query1.finance.yahoo.com/v1/finance/search?${query}`, { headers: { "User-Agent": "Mozilla/5.0 ai-arena/0.5" } }, 15000);
+  return (payload.news ?? []).slice(0, 3).map((item: { title?: string; link?: string; publisher?: string; providerPublishTime?: number }) => ({ source: "Yahoo Finance", title: item.title ?? "Untitled", url: item.link, summary: item.publisher || item.title || "", published_at: item.providerPublishTime ? new Date(item.providerPublishTime * 1000).toISOString() : "" }));
+}
+
+async function tavilySearch(query: string): Promise<ResearchItem[]> {
+  if (!TAVILY_API_KEY) return [];
+  const payload = await jsonFetch("https://api.tavily.com/search", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TAVILY_API_KEY}` }, body: JSON.stringify({ query, topic: "news", search_depth: "basic", time_range: "week", max_results: 3, include_answer: false, include_raw_content: false }) }, 20000);
+  return (payload.results ?? []).slice(0, 3).map((item: { title?: string; url?: string; content?: string; published_date?: string }) => ({ source: "Tavily", title: item.title ?? "Untitled", url: item.url, summary: item.content || item.title || "", published_at: item.published_date ?? "" }));
+}
+
+function dedupeResearch(items: ResearchItem[]) {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = `${item.source}:${item.title}:${item.url ?? ""}`.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(item.title || item.summary);
+  });
+}
 async function fetchCandles(symbol: string, assetClass: AssetClass): Promise<MarketCandle[]> {
   if (assetClass === "commodity") return fetchYahooCandles(symbol);
   const params: Record<string, string> = assetClass === "stock"
@@ -475,6 +555,7 @@ function computeIndicators(rows: MarketCandle[]): IndicatorSnapshot {
 
 function buildMarketSnapshot(state: PersistedArenaState, symbols: string[]): MarketSnapshot[] {
   return symbols.map((symbol) => {
+    const assetClass = state.symbols.find((item) => item.symbol === symbol)?.assetClass ?? "stock";
     const candles = state.candles?.[symbol]?.slice(-30) ?? [];
     if (candles.length < 4) return null;
     const closes = candles.map((item) => item.close);
@@ -483,11 +564,13 @@ function buildMarketSnapshot(state: PersistedArenaState, symbols: string[]): Mar
     const sixAgo = closes.length >= 7 ? closes[closes.length - 7] : 0;
     return {
       symbol,
+      asset_class: assetClass,
       last_close: last,
       one_day_return: prev ? (last - prev) / prev : 0,
       six_day_return: sixAgo ? (last - sixAgo) / sixAgo : 0,
       volatility_12d: last ? stdev(closes.slice(-12)) / last : 0,
       indicators: state.indicators?.[symbol] ?? {},
+      research: state.research?.[symbol] ?? [],
       latest_bars: candles.slice(-8).map((row) => ({ date: new Date(row.timestamp).toISOString().slice(0, 10), close: row.close, volume: row.volume }))
     };
   }).filter(Boolean) as MarketSnapshot[];
@@ -524,13 +607,13 @@ function ruleDecision(agent: AgentProfile, snapshot: MarketSnapshot[], reason?: 
 function buildPrompt(state: PersistedArenaState, agent: AgentProfile, snapshot: MarketSnapshot[]) {
   const payload = {
     agent: { name: agent.name, risk: agent.risk, style: agent.style, custom_prompt: effectivePrompt(agent) },
-    tools: { portfolio_state: "cash, positions, equity from Turso SQLite", market_snapshot: "daily candles and returns", technical_indicators: "SMA/EMA/MACD/RSI/ATR snapshots", fundamentals_news: "Alpha Vantage overview where available; commodities use Yahoo Finance bars", risk_check: "server-side sizing, whitelist, 5-20 bps slippage" },
+    tools: { portfolio_state: "cash, positions, equity from Turso SQLite", market_snapshot: "daily candles and returns", technical_indicators: "SMA/EMA/MACD/RSI/ATR snapshots", technical_news: "Tavily/Yahoo market technical-analysis headlines when configured", fundamentals_news: "Alpha Vantage overview for stocks plus Yahoo/Tavily macro/news summaries; commodities use Yahoo Finance bars", risk_check: "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage" },
     account: { starting_capital: STARTING_CAPITAL, slippage_bps_range: [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], portfolio: portfolioState(state, agent.id) },
     timeframe: "1 day",
     tradable_symbols: snapshot.map((item) => item.symbol),
     market_snapshot: snapshot
   };
-  return `You are one seat in an Alpha Arena style paper-trading competition. Choose exactly one action for the next daily round. Use only the provided market data and custom_prompt. Analyze technical setup and fundamental/macro context. Return one-line minified JSON only, no markdown, no code fence, no newline. Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. Input: ${JSON.stringify(payload)}`;
+  return `You are one seat in an Alpha Arena style paper-trading competition. Think and act like a top trader from an institutional/main-force perspective: infer liquidity, trapped positions, stop zones, accumulation/distribution, trend quality, macro pressure, and invalidation. Choose exactly one action for the next daily round. Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means wait/observe. Use only the provided market data and custom_prompt. Return one-line minified JSON only, no markdown, no code fence, no newline. Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. Input: ${JSON.stringify(payload)}`;
 }
 
 async function callChat(agent: AgentProfile, prompt: string, apiKey: string) {
@@ -594,6 +677,7 @@ function executeDecision(state: PersistedArenaState, agent: AgentProfile, decisi
   const agentId = agent.id;
   const action = decision.action;
   const symbol = decision.symbol;
+  const assetClass = state.symbols.find((item) => item.symbol === symbol)?.assetClass ?? "stock";
   let cash = state.cash[agentId] ?? STARTING_CAPITAL;
   const price = state.latestPrices[symbol];
   const record = (status: string, reason: string, slippage = 0, executionPrice: number | null = null, quantity = 0, notional = 0) => {
@@ -606,45 +690,83 @@ function executeDecision(state: PersistedArenaState, agent: AgentProfile, decisi
     decision.notional = Number(notional.toFixed(4));
     state.orders!.unshift({ agentId, symbol, action, status, quantity: decision.executedQuantity, notional: decision.notional, signalPrice: price ?? null, executionPrice, slippageBps: slippage, reason, createdAt: timestamp });
   };
+  const removeOrUpdate = (index: number, position: Position) => {
+    if (Math.abs(position.quantity) <= 0.000001) state.positions!.splice(index, 1);
+    else state.positions![index] = position;
+  };
 
   if (decision.source === "disabled" || decision.source === "error" || symbol === "--" || action === "HOLD") {
-    record("SKIPPED", action === "HOLD" ? "Model chose HOLD." : "No executable signal.");
+    record("SKIPPED", action === "HOLD" ? "Model chose HOLD / wait for a cleaner setup." : "No executable signal.");
   } else if (!price) {
     record("REJECTED", "No market price available.");
   } else {
     const slippage = MIN_SLIPPAGE_BPS + Math.floor(Math.random() * (MAX_SLIPPAGE_BPS - MIN_SLIPPAGE_BPS + 1));
     const riskScale = agent.risk === "high" ? 1.35 : agent.risk === "low" ? 0.55 : 0.9;
     const confidenceScale = Math.max(0.15, Math.min(1, decision.confidence / 100));
+    const equityBefore = portfolioState(state, agentId).equity;
     const index = state.positions.findIndex((item) => item.agentId === agentId && item.symbol === symbol);
     const current = index >= 0 ? state.positions[index] : null;
+    const currentQty = current?.quantity ?? 0;
+
     if (action === "BUY") {
       const executionPrice = price * (1 + slippage / 10000);
-      const notional = Math.min(cash, cash * 0.55 * riskScale * confidenceScale);
-      if (notional < MIN_TRADE_NOTIONAL) record("REJECTED", "Insufficient cash for minimum notional.", slippage, executionPrice);
-      else {
-        const quantity = notional / executionPrice;
-        const oldQty = current?.quantity ?? 0;
-        const oldCost = oldQty * (current?.avgPrice ?? 0);
-        const nextQty = oldQty + quantity;
-        const avgPrice = (oldCost + notional) / nextQty;
-        const next: Position = { agentId, symbol, quantity: nextQty, avgPrice, marketPrice: price, marketValue: nextQty * price, unrealizedPnl: nextQty * (price - avgPrice) };
-        if (index >= 0) state.positions[index] = next; else state.positions.push(next);
-        cash -= notional;
-        state.cash[agentId] = cash;
-        record("FILLED", "BUY filled after risk sizing and slippage.", slippage, executionPrice, quantity, notional);
+      if (current && currentQty < -0.000001) {
+        const coverNotional = Math.min(cash, Math.abs(currentQty) * executionPrice, equityBefore * 0.45 * riskScale * confidenceScale);
+        if (coverNotional < MIN_TRADE_NOTIONAL) record("REJECTED", "Cash or short exposure is too small to cover.", slippage, executionPrice);
+        else {
+          const coverQty = coverNotional / executionPrice;
+          const next: Position = { ...current, quantity: currentQty + coverQty, marketPrice: price, marketValue: (currentQty + coverQty) * price, unrealizedPnl: (currentQty + coverQty) * (price - current.avgPrice) };
+          cash -= coverNotional;
+          state.cash[agentId] = cash;
+          removeOrUpdate(index, next);
+          record("FILLED", "BUY covered/reduced an existing short position.", slippage, executionPrice, coverQty, coverNotional);
+        }
+      } else {
+        const notional = Math.min(cash, cash * 0.55 * riskScale * confidenceScale);
+        if (notional < MIN_TRADE_NOTIONAL) record("REJECTED", "Insufficient cash for minimum long notional.", slippage, executionPrice);
+        else {
+          const quantity = notional / executionPrice;
+          const oldQty = Math.max(0, currentQty);
+          const oldCost = oldQty * (current?.avgPrice ?? 0);
+          const nextQty = oldQty + quantity;
+          const avgPrice = (oldCost + notional) / nextQty;
+          const next: Position = { agentId, symbol, quantity: nextQty, avgPrice, marketPrice: price, marketValue: nextQty * price, unrealizedPnl: nextQty * (price - avgPrice) };
+          if (index >= 0) state.positions[index] = next; else state.positions.push(next);
+          cash -= notional;
+          state.cash[agentId] = cash;
+          record("FILLED", current && currentQty > 0 ? "BUY added to existing long position." : "BUY opened a long position.", slippage, executionPrice, quantity, notional);
+        }
       }
     } else if (action === "SELL") {
-      const quantityHeld = current?.quantity ?? 0;
       const executionPrice = price * (1 - slippage / 10000);
-      const quantity = quantityHeld * Math.min(1, 0.55 * riskScale * confidenceScale);
-      const notional = quantity * executionPrice;
-      if (!current || quantity <= 0 || notional < MIN_TRADE_NOTIONAL) record("REJECTED", "No position or notional too small to sell.", slippage, executionPrice);
-      else {
-        current.quantity -= quantity;
-        cash += notional;
-        state.cash[agentId] = cash;
-        if (current.quantity <= 0.000001) state.positions.splice(index, 1);
-        record("FILLED", "SELL filled against existing position.", slippage, executionPrice, quantity, notional);
+      if (current && currentQty > 0.000001) {
+        const sellQty = currentQty * Math.min(1, 0.7 * riskScale * confidenceScale);
+        const notional = sellQty * executionPrice;
+        if (notional < MIN_TRADE_NOTIONAL) record("REJECTED", "Reduce-long notional below minimum.", slippage, executionPrice);
+        else {
+          const nextQty = currentQty - sellQty;
+          const next: Position = { ...current, quantity: nextQty, marketPrice: price, marketValue: nextQty * price, unrealizedPnl: nextQty * (price - current.avgPrice) };
+          cash += notional;
+          state.cash[agentId] = cash;
+          removeOrUpdate(index, next);
+          record("FILLED", "SELL reduced/exited an existing long position.", slippage, executionPrice, sellQty, notional);
+        }
+      } else if (assetClass === "stock") {
+        record("REJECTED", "Stocks cannot be sold short; no long position available to reduce.", slippage, executionPrice);
+      } else {
+        const targetNotional = Math.max(0, equityBefore * 0.45 * riskScale * confidenceScale);
+        if (targetNotional < MIN_TRADE_NOTIONAL) record("REJECTED", "Short notional below minimum.", slippage, executionPrice);
+        else {
+          const shortQty = targetNotional / executionPrice;
+          const oldAbs = Math.abs(Math.min(0, currentQty));
+          const nextQty = currentQty - shortQty;
+          const avgPrice = oldAbs > 0 && current ? ((oldAbs * current.avgPrice) + (shortQty * executionPrice)) / (oldAbs + shortQty) : executionPrice;
+          const next: Position = { agentId, symbol, quantity: nextQty, avgPrice, marketPrice: price, marketValue: nextQty * price, unrealizedPnl: nextQty * (price - avgPrice) };
+          if (index >= 0) state.positions[index] = next; else state.positions.push(next);
+          cash += targetNotional;
+          state.cash[agentId] = cash;
+          record("FILLED", currentQty < 0 ? "SELL added to existing short position." : "SELL opened a short position.", slippage, executionPrice, shortQty, targetNotional);
+        }
       }
     }
   }

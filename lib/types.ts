@@ -29,6 +29,7 @@ export type AgentProfile = {
   model: string;
   prompt: string;
   kind: AgentKind;
+  watchlist?: string[];
   enabled: boolean;
 };
 

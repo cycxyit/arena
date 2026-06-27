@@ -29,12 +29,13 @@ type SeatForm = {
   prompt: string;
   risk: "low" | "medium" | "high";
   color: string;
+  watchlist: string[];
 };
 
 export default function AdminPage() {
   const [state, setState] = useState<ArenaState>(emptyState);
   const [message, setMessage] = useState("Ready");
-  const [seat, setSeat] = useState<SeatForm>({ name: "", provider: "openai", model: "gpt-4o-mini", style: "Custom LLM strategy", prompt: "", risk: "medium", color: "#111111" });
+  const [seat, setSeat] = useState<SeatForm>({ name: "", provider: "openai", model: "gpt-4o-mini", style: "Custom LLM strategy", prompt: "", risk: "medium", color: "#111111", watchlist: [] });
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsMessage, setModelsMessage] = useState("Load models from the selected provider.");
@@ -89,7 +90,7 @@ export default function AdminPage() {
     const payload = await response.json();
     setMessage(response.ok ? `Seat saved: ${payload.id}` : payload.error ?? "Failed to save seat");
     if (response.ok) {
-      setSeat({ ...seat, name: "", prompt: "" });
+      setSeat({ ...seat, name: "", prompt: "", watchlist: [] });
       await loadState();
     }
   }
@@ -103,6 +104,21 @@ export default function AdminPage() {
     const payload = await response.json();
     setMessage(response.ok ? `Seat deleted: ${payload.id}` : payload.error ?? "Failed to delete seat");
     if (response.ok) await loadState();
+  }
+
+  function toggleSeatSymbol(symbol: string) {
+    setSeat((current) => {
+      const exists = current.watchlist.includes(symbol);
+      return { ...current, watchlist: exists ? current.watchlist.filter((item) => item !== symbol) : [...current.watchlist, symbol] };
+    });
+  }
+
+  async function resetCompetition() {
+    if (!confirm("Reset all AI accounts to $10,000 and clear positions, orders, and round history?")) return;
+    const response = await fetch("/api/reset", { method: "POST" });
+    const payload = await response.json();
+    setMessage(response.ok ? "Competition reset: all seats start from $10,000" : payload.error ?? "Reset failed");
+    if (response.ok) setState(payload.state);
   }
 
   async function searchProducts(event: FormEvent<HTMLFormElement>) {
@@ -159,6 +175,7 @@ export default function AdminPage() {
         </div>
         <div className="status">
           <span>{message}<small>seats {state.agents.length} / markets {state.symbols.length}</small></span>
+          <button type="button" onClick={resetCompetition}>Reset race</button>
           <Link className="button-link" href="/">Arena</Link>
         </div>
       </header>
@@ -188,7 +205,18 @@ export default function AdminPage() {
               <option value="high">High risk</option>
             </select>
             <input value={seat.color} onChange={(event) => setSeat({ ...seat, color: event.target.value })} placeholder="#111111" />
-            <textarea value={seat.prompt} onChange={(event) => setSeat({ ...seat, prompt: event.target.value })} placeholder="Custom prompt for this seat. Example: favor low drawdown, explain risk first, only trade liquid symbols." />
+            <textarea value={seat.prompt} onChange={(event) => setSeat({ ...seat, prompt: event.target.value })} placeholder="Custom prompt for this seat. Leave empty to use the elite trader / main-force default prompt." />
+            <div className="watchlist-picker">
+              <div><strong>Seat watchlist</strong><span>{seat.watchlist.length ? `${seat.watchlist.length} selected` : "All active products"}</span></div>
+              <div className="watchlist-options">
+                {state.symbols.map((item) => (
+                  <label key={item.symbol}>
+                    <input type="checkbox" checked={seat.watchlist.includes(item.symbol)} onChange={() => toggleSeatSymbol(item.symbol)} />
+                    <span>{item.symbol}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
             <p className="form-note">{modelsMessage}</p>
             <button type="submit">Save seat</button>
           </form>
@@ -196,7 +224,7 @@ export default function AdminPage() {
           <div className="admin-list">
             {state.agents.map((agent) => (
               <article className="admin-row" key={agent.id}>
-                <div><strong>{agent.name}</strong><span>{agent.provider} / {agent.model} / {agent.enabled ? "enabled" : "disabled"}</span>{agent.prompt ? <small>{agent.prompt}</small> : null}</div>
+                <div><strong>{agent.name}</strong><span>{agent.provider} / {agent.model} / {agent.enabled ? "enabled" : "disabled"}</span>{agent.prompt ? <small>{agent.prompt}</small> : null}{agent.watchlist?.length ? <small>Watchlist: {agent.watchlist.join(" / ")}</small> : <small>Watchlist: all active products</small>}</div>
                 <button type="button" onClick={() => removeSeat(agent.id)}>Delete</button>
               </article>
             ))}

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import math
 import os
 import random
@@ -119,6 +119,7 @@ def migrate(conn):
           risk text not null default 'medium',
           color text not null default '#111111',
           prompt text not null default '',
+          watchlist text not null default '[]',
           active integer not null default 1,
           created_at integer not null
         );
@@ -207,6 +208,7 @@ def migrate(conn):
     ensure_column(conn, "decisions", "executed_quantity", "real not null default 0")
     ensure_column(conn, "decisions", "notional", "real not null default 0")
     ensure_column(conn, "seats", "prompt", "text not null default ''")
+    ensure_column(conn, "seats", "watchlist", "text not null default '[]'")
     migrate_starting_capital(conn)
     conn.execute("create index if not exists idx_research_symbol_created on research_items(symbol, created_at desc)")
     cleanup_stale_symbol_cache(conn)
@@ -287,8 +289,8 @@ def seed_seats(conn):
         return
     now = int(time.time() * 1000)
     conn.executemany(
-        "insert into seats (id, name, provider, model, kind, style, risk, color, prompt, active, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-        [(seat["id"], seat["name"], seat["provider"], seat["model"], seat["kind"], seat["style"], seat["risk"], seat["color"], seat.get("prompt", ""), now) for seat in DEFAULT_SEATS],
+        "insert into seats (id, name, provider, model, kind, style, risk, color, prompt, watchlist, active, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        [(seat["id"], seat["name"], seat["provider"], seat["model"], seat["kind"], seat["style"], seat["risk"], seat["color"], seat.get("prompt", ""), json.dumps(seat.get("watchlist", []), separators=(",", ":")), now) for seat in DEFAULT_SEATS],
     )
     conn.commit()
 
@@ -299,24 +301,40 @@ def provider_key_env(provider):
 
 def list_seats(conn, active_only=True):
     where = "where active = 1" if active_only else ""
-    rows = conn.execute(f"select id, name, provider, model, kind, style, risk, color, prompt, active from seats {where} order by created_at asc").fetchall()
+    rows = conn.execute(f"select id, name, provider, model, kind, style, risk, color, prompt, watchlist, active from seats {where} order by created_at asc").fetchall()
     seats = []
     for row in rows:
         seat = dict(row)
         seat["key_env"] = provider_key_env(seat["provider"])
+        seat["watchlist"] = parse_watchlist(seat.get("watchlist"), active_symbol_set(conn))
         seats.append(seat)
     return seats
 
 
+def parse_watchlist(raw, allowed_symbols):
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        values = str(raw).split(",")
+    if not isinstance(values, list):
+        return []
+    allowed = {symbol.upper() for symbol in allowed_symbols}
+    result = []
+    for value in values:
+        symbol = str(value).strip().upper()
+        if symbol in allowed and symbol not in result:
+            result.append(symbol)
+    return result
 def default_prompt(agent):
     style = agent.get("style") or "balanced multi-asset strategy"
     risk = agent.get("risk") or "medium"
     return (
-        f"Act as a disciplined {risk}-risk trading analyst running the {style}. "
-        "For every daily round, combine technical analysis and fundamental/macro context. "
-        "Technical checks: trend, momentum, volatility, recent volume, support/resistance, and risk/reward. "
-        "Fundamental checks: business quality for stocks, macro/rates context for FX, liquidity/adoption/regime for crypto. "
-        "Prefer capital preservation, avoid overtrading, size conviction cautiously, and explain the key risk in the thesis."
+        f"Act like an elite discretionary trader with a market-maker/main-force perspective, running the {style} at {risk} risk. "
+        "Read liquidity, stops, accumulation/distribution, trend, momentum, volatility, support/resistance, and risk/reward. "
+        "Add fundamental/macro context: business quality for stocks, rates/USD flows for FX, liquidity/adoption/regime for crypto, and real rates/USD/liquidity for commodities. "
+        "Avoid overtrading, protect capital, size conviction cautiously, and explain the key risk in the thesis."
     )
 
 
@@ -337,6 +355,7 @@ def public_agent(agent):
         "model": agent["model"],
         "prompt": effective_prompt(agent),
         "kind": agent["kind"],
+        "watchlist": agent.get("watchlist", []),
         "enabled": bool(key_env and env(key_env)),
     }
 
@@ -614,8 +633,10 @@ def build_market_snapshot(conn, symbols):
         closes = [row["close"] for row in candles]
         last = closes[-1]
         prev = closes[-2]
+        asset_row = conn.execute("select asset_class from symbols where symbol = ?", (symbol,)).fetchone()
         snapshot.append({
             "symbol": symbol,
+            "asset_class": asset_row["asset_class"] if asset_row else "stock",
             "last_close": last,
             "one_day_return": (last - prev) / prev if prev else 0,
             "six_day_return": (last - closes[-7]) / closes[-7] if len(closes) >= 7 and closes[-7] else 0,
@@ -627,6 +648,15 @@ def build_market_snapshot(conn, symbols):
     return snapshot
 
 
+def filter_snapshot_for_agent(conn, agent, market_snapshot):
+    watchlist = agent.get("watchlist") or []
+    if not watchlist:
+        return market_snapshot
+    allowed = set(watchlist)
+    filtered = [item for item in market_snapshot if item["symbol"] in allowed]
+    if filtered:
+        return filtered
+    return build_market_snapshot(conn, watchlist)
 def load_research_context(conn, symbol, limit=5):
     rows = conn.execute("select source, title, url, summary, published_at from research_items where symbol = ? order by created_at desc limit ?", (symbol, limit)).fetchall()
     return [{"source": row["source"], "title": row["title"], "url": row["url"], "summary": row["summary"], "published_at": row["published_at"]} for row in rows]
@@ -729,12 +759,12 @@ def llm_decide(conn, agent, market_snapshot):
 
 def build_decision_prompt(agent, market_snapshot, portfolio):
     tradable = [item["symbol"] for item in market_snapshot]
-    payload = {"agent": {"name": agent["name"], "risk": agent["risk"], "style": agent["style"], "custom_prompt": effective_prompt(agent)}, "tools": {"portfolio_state": "cash, positions, equity from local SQLite", "market_snapshot": "daily candles and returns", "technical_indicators": "local SMA/EMA/MACD/RSI/ATR snapshots", "fundamentals_news": "Alpha Vantage overview, Tavily/Yahoo news when configured; commodities use Yahoo Finance price bars", "risk_check": "server-side sizing, symbol whitelist, 5-20 bps slippage"}, "account": {"starting_capital": STARTING_CAPITAL, "slippage_bps_range": [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], "portfolio": portfolio}, "timeframe": "1 day", "tradable_symbols": tradable, "market_snapshot": market_snapshot}
+    payload = {"agent": {"name": agent["name"], "risk": agent["risk"], "style": agent["style"], "custom_prompt": effective_prompt(agent), "watchlist": agent.get("watchlist", [])}, "tools": {"portfolio_state": "cash, positions, equity from local SQLite", "market_snapshot": "daily candles and returns", "technical_indicators": "local SMA/EMA/MACD/RSI/ATR snapshots", "technical_news": "Tavily/Yahoo market technical-analysis headlines when configured", "fundamentals_news": "Alpha Vantage overview for stocks plus Tavily/Yahoo macro/news summaries; commodities use Yahoo Finance price bars", "risk_check": "server-side sizing, symbol whitelist, stock no-naked-short rule, 5-20 bps slippage"}, "account": {"starting_capital": STARTING_CAPITAL, "slippage_bps_range": [MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS], "portfolio": portfolio}, "timeframe": "1 day", "tradable_symbols": tradable, "market_snapshot": market_snapshot}
     return (
         "You are one seat in an Alpha Arena style paper-trading competition. "
-        "Choose exactly one action for the next daily round. Use only the provided market data and the custom_prompt. "
-        "Analyze both technical setup and fundamental/macro context before deciding. "
-        "Think like a human trader: review portfolio, choose intent, then the server will risk-check and execute the order. "
+        "Think and act like a top trader from an institutional/main-force perspective: infer liquidity, trapped positions, stop zones, accumulation/distribution, trend quality, macro pressure, and invalidation. "
+        "Choose exactly one action for the next daily round. Action semantics: BUY means enter/add long, or cover/reduce an existing short. SELL means reduce/exit long; for forex/crypto/commodity it may also enter/add short. Stocks cannot be sold short, so for stocks SELL is only allowed when reducing an existing long. HOLD means wait/observe. "
+        "Use only the provided market data and custom_prompt. "
         "Return one-line minified JSON only, no markdown, no code fence, no newline. "
         "Required keys: action, symbol, confidence, thesis, horizon. action must be BUY, SELL, or HOLD. symbol must be one of tradable_symbols. confidence is 0-100. Keep thesis under 220 characters. "
         f"Input: {json.dumps(payload, separators=(',', ':'))}"
@@ -824,6 +854,18 @@ def state(conn):
     return {"symbols": symbols, "agents": [public_agent(agent) for agent in list_seats(conn)], "decisions": decisions, "equity": equity, "positions": positions, "orders": orders, "cash": cash, "startingCapital": STARTING_CAPITAL, "indicators": indicators, "latestPrices": latest_prices, "dataStatus": {"source": DATA_SOURCE, "entitlement": ENTITLEMENT, "interval": INTERVAL, "errors": errors, "lastSyncAt": last_sync_row["last_sync"] if last_sync_row else None}, "updatedAt": int(time.time() * 1000)}
 
 
+def reset_competition(conn):
+    now = int(time.time() * 1000)
+    conn.execute("delete from decisions")
+    conn.execute("delete from equity_points")
+    conn.execute("delete from account_cash")
+    conn.execute("delete from positions")
+    conn.execute("delete from orders")
+    for row in conn.execute("select id from seats where active = 1").fetchall():
+        conn.execute("insert into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (row["id"], STARTING_CAPITAL, now))
+        conn.execute("insert into equity_points (agent_id, timestamp, equity) values (?, ?, ?)", (row["id"], now, STARTING_CAPITAL))
+    conn.commit()
+    return {"reset": True, "state": state(conn)}
 def add_symbol(conn, symbol, name, asset_class):
     normalized = normalize_symbol(symbol, asset_class)
     now = int(time.time() * 1000)
@@ -855,12 +897,13 @@ def add_seat(conn, payload):
     prompt = str(payload.get("prompt") or "").strip()
     risk = str(payload.get("risk") or "medium").strip().lower()
     color = str(payload.get("color") or "#111111").strip()
+    watchlist = json.dumps(parse_watchlist(payload.get("watchlist"), active_symbol_set(conn)), separators=(",", ":"))
     if risk not in {"low", "medium", "high"}:
         risk = "medium"
     now = int(time.time() * 1000)
     conn.execute(
-        """insert into seats (id, name, provider, model, kind, style, risk, color, prompt, active, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) on conflict(id) do update set name = excluded.name, provider = excluded.provider, model = excluded.model, kind = excluded.kind, style = excluded.style, risk = excluded.risk, color = excluded.color, prompt = excluded.prompt, active = 1""",
-        (seat_id, name, provider, model, kind, style, risk, color, prompt, now),
+        """insert into seats (id, name, provider, model, kind, style, risk, color, prompt, watchlist, active, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) on conflict(id) do update set name = excluded.name, provider = excluded.provider, model = excluded.model, kind = excluded.kind, style = excluded.style, risk = excluded.risk, color = excluded.color, prompt = excluded.prompt, watchlist = excluded.watchlist, active = 1""",
+        (seat_id, name, provider, model, kind, style, risk, color, prompt, watchlist, now),
     )
     conn.commit()
     return {"id": seat_id}
@@ -1014,13 +1057,14 @@ def run_cycle(conn):
     conn.commit()
     remember_errors(conn, errors)
     now = int(time.time() * 1000)
-    market_snapshot = build_market_snapshot(conn, updated)
+    market_snapshot = build_market_snapshot(conn, updated or synced)
     if market_snapshot:
         for agent in list_seats(conn):
+            agent_snapshot = filter_snapshot_for_agent(conn, agent, market_snapshot)
             try:
-                decision = llm_decide(conn, agent, market_snapshot)
+                decision = llm_decide(conn, agent, agent_snapshot)
             except Exception as exc:
-                decision = rule_decide(agent, market_snapshot, f"{agent['provider']} call failed: {exc}")
+                decision = rule_decide(agent, agent_snapshot, f"{agent['provider']} call failed: {exc}")
                 decision["source"] = "error"
                 errors.append(f"{agent['name']}: {exc}")
             update_equity(conn, agent, decision, now)
@@ -1079,6 +1123,11 @@ def insert_decision(conn, agent, decision, now):
     conn.execute("insert into decisions (agent_id, symbol, action, confidence, thesis, horizon, created_at, provider, model, source, slippage_bps, execution_price, order_status, order_reason, executed_quantity, notional) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (agent["id"], decision["symbol"], decision["action"], int(decision["confidence"]), decision["thesis"], decision["horizon"], now, agent["provider"], agent["model"], decision.get("source", "llm"), int(decision.get("slippage_bps", 0)), decision.get("execution_price"), decision.get("order_status", "SKIPPED"), decision.get("order_reason", "No order generated."), float(decision.get("executed_quantity", 0)), float(decision.get("notional", 0))))
 
 
+def asset_class_for(conn, symbol):
+    row = conn.execute("select asset_class from symbols where symbol = ?", (symbol,)).fetchone()
+    return row["asset_class"] if row else "stock"
+
+
 def update_equity(conn, agent, decision, now):
     agent_id = agent["id"]
     cash = ensure_account(conn, agent_id, now)
@@ -1094,52 +1143,84 @@ def update_equity(conn, agent, decision, now):
         conn.execute("insert into equity_points (agent_id, timestamp, equity) values (?, ?, ?)", (agent_id, now, round(account_equity(conn, agent_id), 2)))
         return
     if action == "HOLD":
-        record_order(conn, agent_id, decision, "SKIPPED", 0, 0, price, price, 0, "AI chose HOLD.", now)
+        record_order(conn, agent_id, decision, "SKIPPED", 0, 0, price, price, 0, "AI chose HOLD / wait for a cleaner setup.", now)
         conn.execute("insert into equity_points (agent_id, timestamp, equity) values (?, ?, ?)", (agent_id, now, round(account_equity(conn, agent_id), 2)))
         return
     slippage = random.randint(MIN_SLIPPAGE_BPS, MAX_SLIPPAGE_BPS)
     risk_scale = 1.35 if agent["risk"] == "high" else 0.55 if agent["risk"] == "low" else 0.9
     confidence_scale = max(0.15, min(1.0, int(decision["confidence"]) / 100))
+    equity_before = account_equity(conn, agent_id)
+    asset_class = asset_class_for(conn, symbol)
+    pos = conn.execute("select quantity, avg_price from positions where agent_id = ? and symbol = ?", (agent_id, symbol)).fetchone()
+    current_qty = pos["quantity"] if pos else 0
+    current_avg = pos["avg_price"] if pos else 0
+
     if action == "BUY":
         execution_price = price * (1 + slippage / 10000)
-        target_notional = cash * 0.55 * risk_scale * confidence_scale
-        notional = min(cash, target_notional)
-        if notional < MIN_TRADE_NOTIONAL:
-            record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Insufficient cash for minimum notional.", now)
+        if current_qty < -0.000001:
+            cover_notional = min(cash, abs(current_qty) * execution_price, equity_before * 0.45 * risk_scale * confidence_scale)
+            if cover_notional < MIN_TRADE_NOTIONAL:
+                record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Cash or short exposure is too small to cover.", now)
+            else:
+                cover_qty = cover_notional / execution_price
+                new_qty = current_qty + cover_qty
+                cash -= cover_notional
+                if abs(new_qty) <= 0.000001:
+                    conn.execute("delete from positions where agent_id = ? and symbol = ?", (agent_id, symbol))
+                else:
+                    conn.execute("update positions set quantity = ?, updated_at = ? where agent_id = ? and symbol = ?", (new_qty, now, agent_id, symbol))
+                conn.execute("insert or replace into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (agent_id, round(cash, 6), now))
+                record_order(conn, agent_id, decision, "FILLED", cover_qty, cover_notional, price, execution_price, slippage, "BUY covered/reduced an existing short position.", now)
         else:
-            quantity = notional / execution_price
-            pos = conn.execute("select quantity, avg_price from positions where agent_id = ? and symbol = ?", (agent_id, symbol)).fetchone()
-            old_qty = pos["quantity"] if pos else 0
-            old_avg = pos["avg_price"] if pos else 0
-            new_qty = old_qty + quantity
-            new_avg = ((old_qty * old_avg) + (quantity * execution_price)) / new_qty if new_qty else execution_price
-            conn.execute("insert or replace into positions (agent_id, symbol, quantity, avg_price, updated_at) values (?, ?, ?, ?, ?)", (agent_id, symbol, new_qty, new_avg, now))
-            cash -= quantity * execution_price
-            conn.execute("insert or replace into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (agent_id, round(cash, 6), now))
-            record_order(conn, agent_id, decision, "FILLED", quantity, quantity * execution_price, price, execution_price, slippage, "Buy order filled after risk sizing and slippage.", now)
+            target_notional = cash * 0.55 * risk_scale * confidence_scale
+            notional = min(cash, target_notional)
+            if notional < MIN_TRADE_NOTIONAL:
+                record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Insufficient cash for minimum long notional.", now)
+            else:
+                quantity = notional / execution_price
+                old_qty = max(0, current_qty)
+                new_qty = old_qty + quantity
+                new_avg = ((old_qty * current_avg) + (quantity * execution_price)) / new_qty if new_qty else execution_price
+                conn.execute("insert or replace into positions (agent_id, symbol, quantity, avg_price, updated_at) values (?, ?, ?, ?, ?)", (agent_id, symbol, new_qty, new_avg, now))
+                cash -= notional
+                conn.execute("insert or replace into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (agent_id, round(cash, 6), now))
+                reason = "BUY added to existing long position." if current_qty > 0 else "BUY opened a long position."
+                record_order(conn, agent_id, decision, "FILLED", quantity, notional, price, execution_price, slippage, reason, now)
     elif action == "SELL":
         execution_price = price * (1 - slippage / 10000)
-        pos = conn.execute("select quantity, avg_price from positions where agent_id = ? and symbol = ?", (agent_id, symbol)).fetchone()
-        if not pos or pos["quantity"] <= 0:
-            record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "No long position available to sell.", now)
-        else:
-            sell_qty = pos["quantity"] * min(1.0, 0.7 * risk_scale * confidence_scale)
+        if current_qty > 0.000001:
+            sell_qty = current_qty * min(1.0, 0.7 * risk_scale * confidence_scale)
             notional = sell_qty * execution_price
             if notional < MIN_TRADE_NOTIONAL:
-                record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Sell notional below minimum.", now)
+                record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Reduce-long notional below minimum.", now)
             else:
-                new_qty = max(0, pos["quantity"] - sell_qty)
+                new_qty = current_qty - sell_qty
                 cash += notional
                 if new_qty <= 0.000001:
                     conn.execute("delete from positions where agent_id = ? and symbol = ?", (agent_id, symbol))
                 else:
                     conn.execute("update positions set quantity = ?, updated_at = ? where agent_id = ? and symbol = ?", (new_qty, now, agent_id, symbol))
                 conn.execute("insert or replace into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (agent_id, round(cash, 6), now))
-                record_order(conn, agent_id, decision, "FILLED", sell_qty, notional, price, execution_price, slippage, "Sell order filled against existing long position.", now)
+                record_order(conn, agent_id, decision, "FILLED", sell_qty, notional, price, execution_price, slippage, "SELL reduced/exited an existing long position.", now)
+        elif asset_class == "stock":
+            record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Stocks cannot be sold short; no long position available to reduce.", now)
+        else:
+            target_notional = max(0, equity_before * 0.45 * risk_scale * confidence_scale)
+            if target_notional < MIN_TRADE_NOTIONAL:
+                record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, execution_price, slippage, "Short notional below minimum.", now)
+            else:
+                short_qty = target_notional / execution_price
+                old_abs = abs(min(0, current_qty))
+                new_qty = current_qty - short_qty
+                new_avg = ((old_abs * current_avg) + (short_qty * execution_price)) / (old_abs + short_qty) if old_abs else execution_price
+                conn.execute("insert or replace into positions (agent_id, symbol, quantity, avg_price, updated_at) values (?, ?, ?, ?, ?)", (agent_id, symbol, new_qty, new_avg, now))
+                cash += target_notional
+                conn.execute("insert or replace into account_cash (agent_id, cash, updated_at) values (?, ?, ?)", (agent_id, round(cash, 6), now))
+                reason = "SELL added to existing short position." if current_qty < 0 else "SELL opened a short position."
+                record_order(conn, agent_id, decision, "FILLED", short_qty, target_notional, price, execution_price, slippage, reason, now)
     else:
         record_order(conn, agent_id, decision, "REJECTED", 0, 0, price, None, 0, "Unsupported action.", now)
     conn.execute("insert into equity_points (agent_id, timestamp, equity) values (?, ?, ?)", (agent_id, now, round(account_equity(conn, agent_id), 2)))
-
 
 def main():
     command = sys.argv[1] if len(sys.argv) > 1 else "state"
@@ -1160,6 +1241,8 @@ def main():
         result = {"results": search_products(sys.argv[2])}
     elif command == "run":
         result = run_cycle(conn)
+    elif command == "reset":
+        result = reset_competition(conn)
     else:
         raise SystemExit(f"Unknown command: {command}")
     print(json.dumps(result, ensure_ascii=False))
